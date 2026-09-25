@@ -94,18 +94,9 @@ async def handle_job(ws, job_id: str, task: str, workspace_files: list) -> None:
 
     def on_line(line: str):
         log_buf.append(line)
-        # Best-effort map Codex stdout → Blippy events
-        low = line.lower()
-        if "apply_patch" in low or "apply patch" in low:
-            asyncio.run_coroutine_threadsafe(
-                emit({"type": "thinking", "message": "Applying patch (Codex apply_patch)"}),
-                loop,
-            )
-        elif "exec" in low or "shell" in low or "running" in low:
-            asyncio.run_coroutine_threadsafe(
-                emit({"type": "command_started", "command": line[:200]}),
-                loop,
-            )
+
+    def on_event(ev: dict):
+        asyncio.run_coroutine_threadsafe(emit(ev), loop)
 
     await emit({"type": "model.started", "message": "Qwen generating via Codex provider"})
     result = await loop.run_in_executor(
@@ -116,6 +107,7 @@ async def handle_job(ws, job_id: str, task: str, workspace_files: list) -> None:
             codex_bin=codex_bin,
             codex_home=codex_home,
             on_line=on_line,
+            on_event=on_event,
         ),
     )
     changes = ws_obj.diff_changes()
