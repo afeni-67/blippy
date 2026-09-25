@@ -20,10 +20,12 @@ jobs:
       CMAKE_ARGS: "-DGGML_NATIVE=OFF"
       QWEN_RESPONSES_PORT: "8090"
       QWEN_BASE: http://127.0.0.1:8090/v1
-      QWEN_MAX_TOKENS: "512"
+      QWEN_MAX_TOKENS: "1024"
       BLIPPY_LOG_REQUESTS: "1"
       BLIPPY_REQUEST_LOG: ${{ github.workspace }}/blippy-requests.jsonl
-      E2E_TASK_TIMEOUT: "1500"
+      BLIPPY_LOG_QWEN: "1"
+      BLIPPY_QWEN_LOG: ${{ github.workspace }}/blippy-qwen.txt
+      E2E_TASK_TIMEOUT: "2400"
       CODEX_BIN: ${{ github.workspace }}/.codex-bin/codex
       CODEX_BIN_DIR: ${{ github.workspace }}/.codex-bin
     steps:
@@ -63,6 +65,8 @@ jobs:
           cat "${BLIPPY_REQUEST_LOG:-blippy-requests.jsonl}" 2>/dev/null || echo "(no request log)"
           echo "===== adapter log tail ====="
           tail -n 100 qwen-responses.log 2>/dev/null || true
+          echo "===== qwen raw outputs ====="
+          cat blippy-qwen.txt 2>/dev/null || echo "(no qwen log)"
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -70,5 +74,6 @@ jobs:
           name: qwen-codex-e2e-evidence
           path: |
             blippy-requests.jsonl
+            blippy-qwen.txt
             qwen-responses.log
           if-no-files-found: warn

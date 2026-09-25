@@ -152,63 +152,144 @@ def _tools_instruction(tools: Optional[list]) -> str:
     fn_tools = _available_function_tools(tools)
     if not fn_tools:
         return ""
+    names = [t["name"] for t in fn_tools[:12]]
+    # Keep the instruction SHORT and strict: small models obey a tiny contract
+    # far better than a dumped schema. Full schemas stay server-side; the
+    # adapter sanitizes arguments against them before emitting function_call.
     lines = [
-        "You control a coding agent by EITHER answering in plain text OR requesting exactly one tool call.",
-        "To request a tool call, output ONLY a single line of JSON with this shape:",
-        '{"name": "<tool>", "arguments": { ... }}',
-        "Available tools:",
+        "You drive a coding agent. Reply with EXACTLY ONE of:",
+        "(A) plain text (final answer or thinking out loud), or",
+        '(B) one tool call: a single JSON object {"name": "<tool>", "arguments": {...}} and NOTHING else.',
+        "Rules for (B): no preamble, no explanation, no markdown fences, no trailing text. "
+        "Only double-quoted JSON. Put shell work in exec_command cmd.",
+        f"Tools: {', '.join(names)}.",
+        "Example task: read hello.txt. Correct reply:",
+        '{"name": "exec_command", "arguments": {"cmd": "cat hello.txt"}}',
+        "A reply that DESCRIBES the tool instead of emitting the JSON is always wrong.",
     ]
-    for t in fn_tools[:12]:
-        params = t.get("parameters") or {}
-        props = list((params.get("properties") or {}).keys())[:12]
-        req = params.get("required") or []
-        lines.append(f"- {t.get('name')}: {t.get('description') or ''} args={props} required={req}")
-    lines.append(
-        "Rules: output the JSON tool request alone with no surrounding text when you need a tool; "
-        "otherwise output plain text. Never invent tool results."
-    )
     return "\n".join(lines)
+
+
+def _tools_reminder() -> str:
+    return (
+        "REMINDER: reply with exactly one JSON object like "
+        '{"name": "exec_command", "arguments": {"cmd": "cat hello.txt"}} '
+        "to use a tool, or plain text otherwise. JSON only, no other words, when calling a tool."
+    )
 
 
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
+def _balanced_candidates(text: str) -> List[str]:
+    """Yield JSON-object candidate substrings via balanced-brace scanning.
+
+    Handles preamble/trailing prose. Also yields truncation-repaired variants
+    (auto-closing unbalanced braces) since max_tokens can cut Qwen mid-object.
+    """
+    cands: List[str] = []
+    # Fenced blocks first (most reliable when present).
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL):
+        cands.append(m.group(1))
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth, instr, esc, j = 0, False, False, i
+        while j < n:
+            ch = text[j]
+            if instr:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    instr = False
+            else:
+                if ch == '"':
+                    instr = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        cands.append(text[i : j + 1])
+                        break
+            j += 1
+        else:
+            pass
+        if j >= n and depth > 0:
+            # Truncated: repair by closing open braces/quotes best-effort.
+            frag = text[i:]
+            frag = frag.rstrip()
+            if instr:
+                frag += '"'
+            frag += "}" * depth
+            cands.append(frag)
+        i = (j + 1) if j < n else (i + 1)
+        if len(cands) > 8:
+            break
+    if text.strip().startswith("{"):
+        cands.append(text.strip())
+    return cands
+
+
 def _extract_json_object(text: str) -> Optional[dict]:
     """Extract the first plausible JSON object from Qwen output."""
-    text = text.strip()
-    # Prefer fenced ```json blocks
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    candidates = []
-    if m:
-        candidates.append(m.group(1))
-    candidates.append(text)
-    # Fall back to outermost {...}
-    m2 = _JSON_OBJ_RE.search(text)
-    if m2:
-        candidates.append(m2.group(0))
-    for cand in candidates:
-        try:
-            obj = json.loads(cand)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    # Lenient fallback: Qwen sometimes emits multi-line shell (heredocs) with
-    # literal newlines inside the JSON string, which strict JSON rejects.
-    # Extract {"name": ..., "cmd": ...} tolerantly for the exec_command case.
-    m = re.search(r'"name"\s*:\s*"(?P<name>[^"]+)"', text)
-    if m:
-        name = m.group("name")
-        m2 = re.search(r'"cmd"\s*:\s*"(?P<cmd>.*)"\s*\}\s*\}?', text, re.DOTALL)
-        if m2:
-            raw_cmd = m2.group("cmd")
-            # Unescape common sequences; keep literal newlines as-is for shell.
+    for cand in _balanced_candidates(text.strip()):
+        for strict in (True, False):
+            # strict=False tolerates literal newlines inside strings
+            # (multi-line shell / heredocs), which Qwen often emits.
             try:
-                cmd = json.loads(f'"{raw_cmd}"')
+                obj = json.loads(cand, strict=strict)
             except Exception:
-                cmd = raw_cmd.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
-            return {"name": name, "arguments": {"cmd": cmd}}
+                continue
+            if isinstance(obj, dict):
+                return obj
     return None
+
+
+def _sanitize_arguments(name: str, args: dict, tools: Optional[list]) -> dict:
+    """Keep only schema-known properties with plausible types.
+
+    Qwen likes to copy the whole parameter description into arguments
+    (justification/login/max_output_tokens/...). Unknown or mistyped extras
+    would make Codex reject the call, so drop them here.
+    """
+    schema_props: Optional[dict] = None
+    for t in _available_function_tools(tools):
+        if t.get("name") == name:
+            schema_props = (t.get("parameters") or {}).get("properties") or {}
+            break
+    if not schema_props:
+        return args
+    clean: dict = {}
+    for k, spec in schema_props.items():
+        if k not in args:
+            continue
+        v, want = args[k], (spec or {}).get("type")
+        if want == "string" and isinstance(v, str):
+            clean[k] = v
+        elif want == "boolean" and isinstance(v, bool):
+            clean[k] = v
+        elif want == "number" and isinstance(v, (int, float)) and not isinstance(v, bool):
+            clean[k] = v
+        elif want == "integer" and isinstance(v, int) and not isinstance(v, bool):
+            clean[k] = v
+        elif want == "array" and isinstance(v, list):
+            clean[k] = v
+        elif want == "object" and isinstance(v, dict):
+            clean[k] = v
+        elif want is None:
+            clean[k] = v
+    # Never emit an exec_command call without its required cmd string.
+    if name == "exec_command" and not isinstance(clean.get("cmd"), str):
+        raw_cmd = args.get("cmd")
+        if isinstance(raw_cmd, str):
+            clean["cmd"] = raw_cmd
+    return clean
 
 
 def parse_tool_call(text: str, tools: Optional[list]) -> Optional[Tuple[str, dict, str]]:
@@ -235,6 +316,9 @@ def parse_tool_call(text: str, tools: Optional[list]) -> Optional[Tuple[str, dic
     if "cmd" in obj and "arguments" not in obj and "args" not in obj:
         args = {"cmd": obj["cmd"]}
     if valid_names and name not in valid_names:
+        return None
+    args = _sanitize_arguments(name, args, tools)
+    if name == "exec_command" and not args.get("cmd"):
         return None
     # Preamble = text before the JSON object, if any
     preamble = ""
@@ -277,9 +361,14 @@ def run_response(body: dict, llm=None) -> dict:
         sys_parts.append(tool_instr)
     if sys_parts:
         messages = [{"role": "system", "content": "\n\n".join(sys_parts)}] + messages
+    if tools:
+        # Small models obey the LAST instruction best: restate the contract
+        # after Codex's long instructions instead of only at the top.
+        messages = messages + [{"role": "user", "content": _tools_reminder()}]
 
     out = chat(llm, messages, max_tokens=int(os.environ.get("QWEN_MAX_TOKENS", "1024")), temperature=0.2)
     text = (out.get("raw") or "").strip()
+    _log_qwen(text)
     resp_id = f"resp_{uuid.uuid4().hex}"
     model = body.get("model") or "qwen3-4b-q4_k_m"
 
@@ -332,6 +421,16 @@ def run_response(body: dict, llm=None) -> dict:
 # Set BLIPPY_LOG_REQUESTS=1 and BLIPPY_REQUEST_LOG=/path/to.jsonl to record
 # a compact summary of every Responses request Codex sends.
 # ---------------------------------------------------------------------------
+
+def _log_qwen(text: str) -> None:
+    if os.environ.get("BLIPPY_LOG_QWEN") != "1":
+        return
+    try:
+        with open(os.environ.get("BLIPPY_QWEN_LOG", "/tmp/blippy-qwen.txt"), "a") as f:
+            f.write(text + "\n====\n")
+    except Exception as e:
+        print(f"[qwen-responses] qwen log failed: {e}", flush=True)
+
 
 def _log_request(body: dict) -> None:
     if os.environ.get("BLIPPY_LOG_REQUESTS") != "1":
