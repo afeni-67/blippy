@@ -327,6 +327,35 @@ def run_response(body: dict, llm=None) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Optional request logging (test observability only; off by default).
+# Set BLIPPY_LOG_REQUESTS=1 and BLIPPY_REQUEST_LOG=/path/to.jsonl to record
+# a compact summary of every Responses request Codex sends.
+# ---------------------------------------------------------------------------
+
+def _log_request(body: dict) -> None:
+    if os.environ.get("BLIPPY_LOG_REQUESTS") != "1":
+        return
+    try:
+        inp = body.get("input")
+        types = [it.get("type") if isinstance(it, dict) else "?" for it in inp] if isinstance(inp, list) else inp
+        rec = {
+            "model": body.get("model"),
+            "stream": body.get("stream"),
+            "keys": sorted(body.keys()),
+            "n_input": len(inp) if isinstance(inp, list) else inp,
+            "input_types": types if isinstance(types, list) and len(types) <= 12 else str(types)[:500],
+            "n_tools": len(body.get("tools") or []),
+            "tool_names": [
+                t.get("name") for t in (body.get("tools") or []) if isinstance(t, dict)
+            ][:12],
+        }
+        with open(os.environ.get("BLIPPY_REQUEST_LOG", "/tmp/blippy-requests.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        print(f"[qwen-responses] request log failed: {e}", flush=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[qwen-responses] {fmt % args}", flush=True)
@@ -369,6 +398,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "invalid json"})
             return
         stream = bool(body.get("stream"))
+        _log_request(body)
         try:
             resp = run_response(body)
         except Exception as e:

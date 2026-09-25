@@ -1,0 +1,74 @@
+# Qwen x Codex end-to-end (REAL model, REAL Codex, REAL tools) on GitHub Actions.
+# Trigger manually: Actions -> "Qwen Codex E2E" -> Run workflow (optionally pick ref).
+# This is the proof job for: official `codex exec` using Qwen (local GGUF)
+# as its ONLY model through worker/qwen/responses_server.py.
+name: Qwen Codex E2E
+
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MODEL_REPO: Qwen/Qwen3-4B-GGUF
+      MODEL_FILE: Qwen3-4B-Q4_K_M.gguf
+      MODEL_DIR: models
+      LLM_THREADS: "3"
+      LLM_CTX: "8192"
+      CMAKE_ARGS: "-DGGML_NATIVE=OFF"
+      QWEN_RESPONSES_PORT: "8090"
+      QWEN_BASE: http://127.0.0.1:8090/v1
+      QWEN_MAX_TOKENS: "512"
+      BLIPPY_LOG_REQUESTS: "1"
+      BLIPPY_REQUEST_LOG: ${{ github.workspace }}/blippy-requests.jsonl
+      E2E_TASK_TIMEOUT: "1500"
+      CODEX_BIN: ${{ github.workspace }}/.codex-bin/codex
+      CODEX_BIN_DIR: ${{ github.workspace }}/.codex-bin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install worker deps (includes llama-cpp-python, same as proven benchmark)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+      - name: Install official Codex CLI (upstream harness)
+        run: |
+          bash worker/codex/install_codex.sh
+          "$CODEX_BIN" --version
+      - name: Start Qwen Responses adapter (REAL GGUF on this runner)
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
+          nohup python -m worker.qwen.responses_server > qwen-responses.log 2>&1 &
+          echo $! > qwen-responses.pid
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8090/health > /dev/null; then
+              echo "adapter ready after ${i}x10s"
+              break
+            fi
+            sleep 10
+          done
+          curl -sf http://127.0.0.1:8090/health || { echo "adapter never became ready"; cat qwen-responses.log; exit 1; }
+      - name: Run E2E (real Codex + real Qwen + real tools)
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
+          python worker/codex/test_qwen_e2e.py
+      - name: Dump evidence
+        if: always()
+        run: |
+          echo "===== requests seen by adapter ====="
+          cat "${BLIPPY_REQUEST_LOG:-blippy-requests.jsonl}" 2>/dev/null || echo "(no request log)"
+          echo "===== adapter log tail ====="
+          tail -n 100 qwen-responses.log 2>/dev/null || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-codex-e2e-evidence
+          path: |
+            blippy-requests.jsonl
+            qwen-responses.log
+          if-no-files-found: warn
