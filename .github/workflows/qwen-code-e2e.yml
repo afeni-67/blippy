@@ -1,0 +1,87 @@
+# Qwen Code x Qwen E2E: official `qwen -p` harness + local Qwen GGUF model.
+# Task: write about.html (fashion brand About page) with real Qwen Code tools.
+# Trigger manually: Actions -> "Qwen Code E2E" -> Run workflow.
+name: Qwen Code E2E
+
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MODEL_REPO: Qwen/Qwen3-4B-GGUF
+      MODEL_FILE: Qwen3-4B-Q4_K_M.gguf
+      MODEL_DIR: models
+      LLM_THREADS: "3"
+      LLM_CTX: "16384"
+      CMAKE_ARGS: "-DGGML_NATIVE=OFF"
+      QWEN_CHAT_PORT: "8091"
+      QWEN_CHAT_BASE: http://127.0.0.1:8091/v1
+      QWEN_MAX_TOKENS: "2048"
+      BLIPPY_LOG_REQUESTS: "1"
+      BLIPPY_REQUEST_LOG: ${{ github.workspace }}/blippy-chat-requests.jsonl
+      BLIPPY_LOG_QWEN: "1"
+      BLIPPY_QWEN_LOG: ${{ github.workspace }}/blippy-qwen-chat.txt
+      E2E_TASK_TIMEOUT: "1800"
+      E2E_MAX_TURNS: "8"
+      E2E_WALL_TIME: "25m"
+      BLIPPY_QWEN_API_KEY: blippy-local
+      QWEN_BIN: ${{ github.workspace }}/.qwen-bin/qwen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install worker deps (llama-cpp-python, same proven setup)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+      - name: Install official Qwen Code CLI (the harness)
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/.qwen-bin"
+          npm install -g @qwen-code/qwen-code@latest
+          QWEN_PATH="$(command -v qwen)"
+          echo "qwen at $QWEN_PATH"
+          ln -sf "$QWEN_PATH" "${GITHUB_WORKSPACE}/.qwen-bin/qwen"
+          "${GITHUB_WORKSPACE}/.qwen-bin/qwen" --version
+      - name: Start Qwen chat server (REAL GGUF on this runner)
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
+          nohup python -m worker.qwen.chat_server > qwen-chat.log 2>&1 &
+          echo $! > qwen-chat.pid
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8091/health > /dev/null; then
+              echo "chat adapter ready after ${i}x10s"
+              break
+            fi
+            sleep 10
+          done
+          curl -sf http://127.0.0.1:8091/health || { echo "adapter never ready"; cat qwen-chat.log; exit 1; }
+      - name: Run about-page E2E (real Qwen Code + real Qwen + real tools)
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE:$PYTHONPATH"
+          python worker/qwencode/test_about_page.py
+      - name: Dump evidence
+        if: always()
+        run: |
+          echo "===== chat requests seen by adapter ====="
+          cat blippy-chat-requests.jsonl 2>/dev/null || echo "(no request log)"
+          echo "===== qwen raw outputs ====="
+          cat blippy-qwen-chat.txt 2>/dev/null || echo "(no qwen log)"
+          echo "===== chat server log tail ====="
+          tail -n 60 qwen-chat.log 2>/dev/null || true
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-code-e2e-evidence
+          path: |
+            blippy-chat-requests.jsonl
+            blippy-qwen-chat.txt
+            qwen-chat.log
+          if-no-files-found: warn
