@@ -62,12 +62,57 @@ def _log(body: dict, note: str = "") -> None:
         print(f"[qwen-chat] request log failed: {e}", flush=True)
 
 
+def _text_of_part(part: Any) -> str:
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        if part.get("type") in ("text", "input_text", "output_text"):
+            return str(part.get("text") or "")
+        if "text" in part and isinstance(part["text"], str):
+            return part["text"]
+        if part.get("type") in ("image_url", "input_image"):
+            return "[image omitted: vision not supported by this model]"
+        return json.dumps(part)[:2000]
+    return str(part)
+
+
+def _sanitize_messages(messages: Any) -> List[dict]:
+    """Normalize messages to plain-text content for the GGUF chat template.
+
+    Qwen Code (Gemini lineage) may send content as lists with part types the
+    llama.cpp Qwen template cannot concatenate (this produced
+    `can only concatenate str (not "list") to str` 500s on every request).
+    Tool definitions and tool_calls fields are preserved untouched — only the
+    human-readable `content` is flattened.
+    """
+    if isinstance(messages, str):
+        return [{"role": "user", "content": messages}]
+    if not isinstance(messages, list):
+        return [{"role": "user", "content": str(messages)}]
+    out: List[dict] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role") or "user"
+        if role not in ("system", "user", "assistant", "tool"):
+            role = "user"
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "\n".join(t for t in (_text_of_part(p) for p in content) if t)
+        elif not isinstance(content, str):
+            content = "" if content is None else str(content)
+        clean: dict = {"role": role, "content": content}
+        for k in ("name", "tool_call_id", "tool_calls"):
+            if m.get(k) is not None:
+                clean[k] = m[k]
+        out.append(clean)
+    return out or [{"role": "user", "content": "Continue."}]
+
+
 def run_chat(body: dict, llm=None) -> dict:
     """Non-streaming Chat Completions object via llama.cpp (tools passed through)."""
     llm = llm if llm is not None else get_llm()
-    messages = body.get("messages") or []
-    if isinstance(messages, str):
-        messages = [{"role": "user", "content": messages}]
+    messages = _sanitize_messages(body.get("messages"))
     kwargs: Dict[str, Any] = {
         "messages": messages,
         "temperature": float(body.get("temperature", 0.2)),
@@ -151,7 +196,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             resp = run_chat(body)
         except Exception as e:
-            print(f"[qwen-chat] inference error: {e}", flush=True)
+            import traceback as _tb
+            print(f"[qwen-chat] inference error: {e}\n{_tb.format_exc()}", flush=True)
             self._json(500, {"error": {"message": str(e)}})
             return
         if not stream:
