@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: blippy-api
+    runtime: python
+    rootDir: api
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: BLIPPY_WORKER_TOKEN
+        sync: false
+      - key: BLIPPY_CLIENT_TOKEN
+        sync: false
+      - key: REDIS_URL
+        sync: false

@@ -1,0 +1,59 @@
+# Blippy coding workers — Qwen runs HERE on the runner, not on user devices.
+# Keep-alive / wave scheduling (20 workers, +3h second wave) is OUT OF SCOPE —
+# the project owner wires that separately (same pattern as ScholarReach).
+name: Blippy Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: "How long this worker stays connected (minutes)"
+        required: false
+        default: "300"
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 workers per run (same scale as ScholarReach extract fleet)
+        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    env:
+      MODEL_REPO: Qwen/Qwen3-4B-GGUF
+      MODEL_FILE: Qwen3-4B-Q4_K_M.gguf
+      MODEL_DIR: models
+      LLM_THREADS: "3"
+      LLM_CTX: "4096"
+      CMAKE_ARGS: "-DGGML_NATIVE=OFF"
+      BLIPPY_API_URL: ${{ secrets.BLIPPY_API_URL }}
+      BLIPPY_WORKER_TOKEN: ${{ secrets.BLIPPY_WORKER_TOKEN }}
+      BLIPPY_WORKER_ID: gha-${{ github.run_id }}-w${{ matrix.worker }}
+      BLIPPY_MAX_ITERS: "12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install worker deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r worker/requirements.txt
+      - name: Host info
+        run: |
+          free -h
+          nproc
+          df -h .
+      - name: Run Blippy worker (outbound WebSocket)
+        run: |
+          if [ -z "$BLIPPY_API_URL" ]; then
+            echo "Set secret BLIPPY_API_URL (Render API base URL)"
+            exit 1
+          fi
+          if [ -z "$BLIPPY_WORKER_TOKEN" ]; then
+            echo "Set secret BLIPPY_WORKER_TOKEN"
+            exit 1
+          fi
+          # Stay up for the job window; reconnect loop is inside worker/main.py
+          python -m worker.main
