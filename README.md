@@ -1,128 +1,81 @@
 # Blippy
 
-**Remote coding agent.** You type a task in your project; a GitHub Actions worker runs **Qwen locally on the runner**, streams progress, and returns file changes that the CLI applies on your machine.
+Remote coding agent: **actual OpenAI Codex harness** on a GitHub Actions worker, with **Qwen** only as the model backend.
 
 > **Qwen inference runs remotely on the Blippy worker. Users do not install or run Qwen locally.**
 
-> **GitHub Actions runner persistence/keep-alive is intentionally out of scope. The project owner will provide that separately** (e.g. ScholarReach-style 20-matrix waves, second wave at +3h).
+> **GitHub Actions keep-alive is out of scope** (owner provides ScholarReach-style 20-worker / +3h waves).
 
 ## Architecture
 
 ```
-USER DEVICE (Blippy CLI only)
+User (Blippy CLI only)
         │ HTTPS + SSE
         ▼
-   BLIPPY API (Render)
-        │ WebSocket (worker outbound)
+Blippy API (Render + MongoDB)
+        │ WebSocket (outbound from worker)
         ▼
-GITHUB ACTIONS WORKER
-   ├── Coding harness (tools)
-   └── Qwen3-4B Q4_K_M (llama-cpp-python, CPU)
+GitHub Actions worker
+        ├── official Codex CLI (`codex exec`)  ← ONLY agent loop / tools / apply_patch / shell
+        └── Qwen Responses adapter → model_runner → llama.cpp → Qwen3-4B Q4_K_M GGUF
 ```
 
-- User **never** downloads the GGUF.
-- Runner **never** needs inbound ports; worker dials out to `BLIPPY_API_URL`.
+There is **one agent loop: Codex**. Blippy does not reimplement it.
 
-## API endpoints
+## Upstream Codex
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| POST | `/jobs` | Create coding job `{client_id, task, workspace}` |
-| GET | `/jobs/:id` | Job status |
-| GET | `/jobs/:id/events` | **SSE** progress stream |
-| POST | `/workers/register` | Worker registration |
-| POST | `/workers/heartbeat` | Worker health |
-| WS | `/workers/ws?token=&worker_id=` | Persistent worker connection |
+- Source: https://github.com/openai/codex  
+- Pinned inspection commit: see `worker/codex/CODEX_UPSTREAM_COMMIT.txt`  
+- Headless entrypoint: **`codex exec`** (`codex-rs/exec`, CLI subcommand in `codex-rs/cli`)  
+- Tools / apply_patch / shell: Codex crates (`apply-patch`, `core`, sandbox/exec) inside the official binary  
+- Model boundary: `ModelProviderInfo` + `wire_api = "responses"` only (`Chat` wire API removed upstream)
 
-### Job states
+## Qwen adapter
 
-`queued` → `assigned` → `running` → `completed` | `failed` | `cancelled`
+Codex only speaks **Responses API** (`POST /v1/responses`).
 
-Stale jobs from disconnected workers are requeued.
+`worker/qwen/responses_server.py` is the **model/provider adapter**:
 
-### SSE event types
+```
+Codex → HTTP 127.0.0.1:8090/v1/responses → responses_server → inference.chat → model_runner → llama.cpp → GGUF
+```
 
-`job_queued`, `worker_assigned`, `thinking`, `reading_file`, `file_created`, `file_modified`, `command_started`, `command_finished`, `job_completed`, `job_failed`
+Preserved:
 
-### Worker protocol (WebSocket JSON)
+- `worker/qwen/model_runner.py`
+- `worker/qwen/inference.py`
 
-- Worker → API: `idle`, `heartbeat`, `event`, `job_result`
-- API → Worker: `job_assigned` `{job_id, task, workspace}`
+No OpenAI/Claude/Gemini/OpenRouter cloud model for inference.
 
-## Qwen integration
+## Removed
 
-Reuses the proven stack from `local-llm-actions-benchmark`:
+- Custom Python agent loop (`worker/harness/agent.py`) — **deleted**
+- Homemade tool dispatcher / fake apply_patch — **not used**
 
-- Model: `Qwen/Qwen3-4B-GGUF` → `Qwen3-4B-Q4_K_M.gguf` (Apache-2.0)
-- Runtime: `llama-cpp-python`, `n_gpu_layers=0`
-- Code: `worker/qwen/model_runner.py` + `worker/qwen/inference.py`
+`worker/harness/workspace.py` only creates a temp dir and computes the **final diff** after Codex mutates files.
 
-## Multi-worker
+## API / worker / CLI
 
-- Workflow matrix **20 workers** per dispatch (`blippy-worker.yml`).
-- API assigns one queued job per idle WebSocket connection (atomic Mongo claim).
-- Busy workers skip; jobs wait in `queued` until an idle worker appears.
+Unchanged Blippy infrastructure: Mongo jobs, SSE, worker WebSocket, atomic claim, CLI apply changes.
 
-Wave / 3-hour overlap scheduling is **owner-side** (same idea as ScholarReach wake), not in this repo’s keep-alive.
+## Env
 
-## Environment variables
+**API:** `MONGODB_URI`, `BLIPPY_WORKER_TOKEN`, `BLIPPY_CLIENT_TOKEN`  
+**Worker secrets:** `BLIPPY_API_URL`, `BLIPPY_WORKER_TOKEN`
 
-**API (Render)**
-
-- `MONGODB_URI`
-- `BLIPPY_WORKER_TOKEN`
-- `BLIPPY_CLIENT_TOKEN`
-- `REDIS_URL` (optional; MVP uses Mongo + in-process bus)
-
-**Worker (Actions secrets)**
-
-- `BLIPPY_API_URL` — e.g. `https://blippy-api.onrender.com`
-- `BLIPPY_WORKER_TOKEN`
-
-**CLI**
-
-- `BLIPPY_API_URL`
-- `BLIPPY_CLIENT_TOKEN`
-
-## Local development
+## Local test
 
 ```bash
 # API
-cd api
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export MONGODB_URI='mongodb+srv://...'
-export BLIPPY_WORKER_TOKEN=dev-worker-token
-uvicorn app.main:app --reload --port 8000
+cd api && pip install -r requirements.txt
+export MONGODB_URI=... BLIPPY_WORKER_TOKEN=dev-worker-token
+uvicorn app.main:app --port 8000
 
-# Worker (needs Qwen download ~2.5GB + RAM)
-cd ..
+# Worker (downloads GGUF + Codex binary)
 pip install -r worker/requirements.txt
-export BLIPPY_API_URL=http://localhost:8000
-export BLIPPY_WORKER_TOKEN=dev-worker-token
+export BLIPPY_API_URL=http://localhost:8000 BLIPPY_WORKER_TOKEN=dev-worker-token
 python -m worker.main
 
 # CLI
-pip install httpx
-export BLIPPY_API_URL=http://localhost:8000
-mkdir -p /tmp/demo && cd /tmp/demo
-python /path/to/blippy/cli/blippy.py --empty "Build me a modern fashion landing page"
+python cli/blippy.py --empty "Build me a modern fashion landing page"
 ```
-
-## One complete job test
-
-1. Start API with MongoDB.
-2. Start one worker (local or Actions).
-3. Run CLI task with `--empty` in an empty folder.
-4. Watch SSE lines: worker assigned → file_created → job_completed.
-5. Confirm `index.html` / CSS / JS appeared locally.
-
-## Production CLI remaining work
-
-- Richer TUI, auth accounts, project ignore rules, diff review before apply, cancel job.
-
-## Render deployment remaining work
-
-- Create Web Service from `api/`, set env vars, attach MongoDB URI.
-- Set Actions secrets `BLIPPY_API_URL` + `BLIPPY_WORKER_TOKEN`.
-- Owner adds wake scheduler for continuous 20-worker waves.
