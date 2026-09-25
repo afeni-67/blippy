@@ -1,4 +1,4 @@
-# Blippy workers: official Codex CLI harness + Qwen GGUF on the runner.
+# Blippy workers: official Qwen Code CLI harness + Qwen GGUF on the runner.
 # Keep-alive / 20×3h waves: out of scope (owner-provided).
 name: Blippy Worker
 
@@ -18,28 +18,31 @@ jobs:
       MODEL_FILE: Qwen3-4B-Q4_K_M.gguf
       MODEL_DIR: models
       LLM_THREADS: "3"
-      LLM_CTX: "4096"
+      LLM_CTX: "16384"
       CMAKE_ARGS: "-DGGML_NATIVE=OFF"
       BLIPPY_API_URL: ${{ secrets.BLIPPY_API_URL }}
       BLIPPY_WORKER_TOKEN: ${{ secrets.BLIPPY_WORKER_TOKEN }}
       BLIPPY_WORKER_ID: gha-${{ github.run_id }}-w${{ matrix.worker }}
-      QWEN_RESPONSES_PORT: "8090"
-      CODEX_BIN: ${{ github.workspace }}/.codex-bin/codex
-      CODEX_BIN_DIR: ${{ github.workspace }}/.codex-bin
+      QWEN_CHAT_PORT: "8091"
+      QWEN_BIN: qwen
+      BLIPPY_QWEN_API_KEY: blippy-local
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install worker deps
         run: |
           python -m pip install --upgrade pip
           pip install -r worker/requirements.txt
-      - name: Install official Codex CLI (upstream harness)
+      - name: Install official Qwen Code CLI (upstream harness)
         run: |
-          bash worker/codex/install_codex.sh
-          echo "CODEX_BIN=$CODEX_BIN"
-          "$CODEX_BIN" --version || true
+          bash worker/qwencode/install_qwencode.sh
+          command -v qwen
+          qwen --version || true
       - name: Run Blippy worker
         run: |
           test -n "$BLIPPY_API_URL" || { echo "missing BLIPPY_API_URL secret"; exit 1; }

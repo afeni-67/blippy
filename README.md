@@ -1,6 +1,6 @@
 # Blippy
 
-Remote coding agent: **actual OpenAI Codex harness** on a GitHub Actions worker, with **Qwen** only as the model backend.
+Remote coding agent: **official Qwen Code CLI harness** on a GitHub Actions worker, with **Qwen (local GGUF)** as the only model backend.
 
 > **Qwen inference runs remotely on the Blippy worker. Users do not install or run Qwen locally.**
 
@@ -16,28 +16,25 @@ Blippy API (Render + MongoDB)
         │ WebSocket (outbound from worker)
         ▼
 GitHub Actions worker
-        ├── official Codex CLI (`codex exec`)  ← ONLY agent loop / tools / apply_patch / shell
-        └── Qwen Responses adapter → model_runner → llama.cpp → Qwen3-4B Q4_K_M GGUF
+        ├── official Qwen Code CLI (`qwen -p`, headless)  ← ONLY agent loop / tools
+        └── Qwen chat adapter → model_runner → llama.cpp → Qwen3-4B Q4_K_M GGUF
 ```
 
-There is **one agent loop: Codex**. Blippy does not reimplement it.
+There is **one agent loop: Qwen Code**. Blippy does not reimplement it.
 
-## Upstream Codex
+## Upstream harness
 
-- Source: https://github.com/openai/codex  
-- Pinned inspection commit: see `worker/codex/CODEX_UPSTREAM_COMMIT.txt`  
-- Headless entrypoint: **`codex exec`** (`codex-rs/exec`, CLI subcommand in `codex-rs/cli`)  
-- Tools / apply_patch / shell: Codex crates (`apply-patch`, `core`, sandbox/exec) inside the official binary  
-- Model boundary: `ModelProviderInfo` + `wire_api = "responses"` only (`Chat` wire API removed upstream)
+- Source: https://github.com/QwenLM/qwen-code
+- Headless entrypoint: **`qwen -p "..." --yolo`** (scripts/CI mode)
+- Tools / file edits / shell: inside the official binary
+- Model boundary: OpenAI-compatible Chat Completions (`POST /v1/chat/completions`)
 
 ## Qwen adapter
 
-Codex only speaks **Responses API** (`POST /v1/responses`).
-
-`worker/qwen/responses_server.py` is the **model/provider adapter**:
+`worker/qwen/chat_server.py` is the **model/provider adapter**:
 
 ```
-Codex → HTTP 127.0.0.1:8090/v1/responses → responses_server → inference.chat → model_runner → llama.cpp → GGUF
+Qwen Code → HTTP 127.0.0.1:8091/v1/chat/completions → chat_server → llama.cpp → GGUF
 ```
 
 Preserved:
@@ -47,20 +44,15 @@ Preserved:
 
 No OpenAI/Claude/Gemini/OpenRouter cloud model for inference.
 
-## Removed
-
-- Custom Python agent loop (`worker/harness/agent.py`) — **deleted**
-- Homemade tool dispatcher / fake apply_patch — **not used**
-
-`worker/harness/workspace.py` only creates a temp dir and computes the **final diff** after Codex mutates files.
+`worker/harness/workspace.py` only creates a temp dir and computes the **final diff** after Qwen Code mutates files.
 
 ## API / worker / CLI
 
-Unchanged Blippy infrastructure: Mongo jobs, SSE, worker WebSocket, atomic claim, CLI apply changes.
+Mongo jobs, SSE, worker WebSocket, atomic claim, CLI apply changes.
 
 ## Env
 
-**API:** `MONGODB_URI`, `BLIPPY_WORKER_TOKEN`, `BLIPPY_CLIENT_TOKEN`  
+**API:** `MONGODB_URI`, `BLIPPY_WORKER_TOKEN`, `BLIPPY_CLIENT_TOKEN`
 **Worker secrets:** `BLIPPY_API_URL`, `BLIPPY_WORKER_TOKEN`
 
 ## Local test
@@ -71,11 +63,18 @@ cd api && pip install -r requirements.txt
 export MONGODB_URI=... BLIPPY_WORKER_TOKEN=dev-worker-token
 uvicorn app.main:app --port 8000
 
-# Worker (downloads GGUF + Codex binary)
+# Worker (downloads GGUF + Qwen Code binary)
 pip install -r worker/requirements.txt
 export BLIPPY_API_URL=http://localhost:8000 BLIPPY_WORKER_TOKEN=dev-worker-token
 python -m worker.main
 
 # CLI
 python cli/blippy.py --empty "Build me a modern fashion landing page"
+```
+
+## Harness proof (runs on GHA, real GGUF)
+
+```bash
+# dispatched manually: Actions -> "Qwen Code E2E" -> Run workflow
+# writes about.html (fashion About page) with real Qwen Code tools
 ```

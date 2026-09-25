@@ -3,10 +3,10 @@
 Blippy worker on GitHub Actions.
 
   outbound WebSocket → Blippy API
-  Qwen Responses adapter (local) ← Codex model_provider boundary
-  official Codex CLI (codex exec) = ONLY agent loop / tools / apply_patch / shell
+  local Qwen GGUF via worker/qwen/chat_server.py (model boundary only)
+  official Qwen Code CLI (`qwen -p`, headless) = ONLY agent loop / tools
 
-Users never install Qwen or Codex for inference on their device.
+Users never install Qwen or Qwen Code for inference on their device.
 """
 from __future__ import annotations
 
@@ -25,30 +25,37 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from worker.harness.workspace import Workspace
-from worker.codex.run_codex_job import write_codex_home, run_codex_exec
+from worker.qwencode.run_qwencode_job import write_qwen_home, run_qwen_exec
 
 API_URL = os.environ.get("BLIPPY_API_URL", "http://localhost:8000").rstrip("/")
 WS_URL = API_URL.replace("https://", "wss://").replace("http://", "ws://") + "/workers/ws"
 TOKEN = os.environ.get("BLIPPY_WORKER_TOKEN", "dev-worker-token")
 WORKER_ID = os.environ.get("BLIPPY_WORKER_ID") or f"worker-{uuid.uuid4().hex[:8]}"
-QWEN_PORT = int(os.environ.get("QWEN_RESPONSES_PORT", "8090"))
-CODEX_BIN = os.environ.get("CODEX_BIN", str(Path.home() / ".local/bin/codex"))
+QWEN_CHAT_PORT = int(os.environ.get("QWEN_CHAT_PORT", "8091"))
+QWEN_BIN = os.environ.get("QWEN_BIN", "qwen")
 
 
-def ensure_codex_binary() -> str:
-    if Path(CODEX_BIN).exists():
-        return CODEX_BIN
-    script = ROOT / "worker/codex/install_codex.sh"
+def ensure_qwen_binary() -> str:
+    found = QWEN_BIN if os.path.isabs(QWEN_BIN) else None
+    if found and Path(found).exists():
+        return found
+    import shutil as _shutil
+
+    path = _shutil.which(QWEN_BIN)
+    if path:
+        return path
+    script = ROOT / "worker/qwencode/install_qwencode.sh"
     subprocess.check_call(["bash", str(script)], cwd=str(ROOT))
-    return CODEX_BIN
+    path = _shutil.which("qwen") or QWEN_BIN
+    return path
 
 
-def start_qwen_responses_server() -> subprocess.Popen:
+def start_qwen_chat_server() -> subprocess.Popen:
     env = os.environ.copy()
-    env["QWEN_RESPONSES_PORT"] = str(QWEN_PORT)
+    env["QWEN_CHAT_PORT"] = str(QWEN_CHAT_PORT)
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "worker.qwen.responses_server"],
+        [sys.executable, "-m", "worker.qwen.chat_server"],
         cwd=str(ROOT),
         env=env,
         stdout=subprocess.PIPE,
@@ -62,97 +69,81 @@ def start_qwen_responses_server() -> subprocess.Popen:
             print(line.rstrip(), flush=True)
 
     threading.Thread(target=_pump, daemon=True).start()
-    # wait until up
     import urllib.request
 
     for _ in range(120):
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{QWEN_PORT}/health", timeout=2)
-            print("[blippy] Qwen Responses adapter ready", flush=True)
+            urllib.request.urlopen(f"http://127.0.0.1:{QWEN_CHAT_PORT}/health", timeout=2)
+            print("[blippy] Qwen chat adapter ready", flush=True)
             return proc
         except Exception:
             if proc.poll() is not None:
-                raise RuntimeError("Qwen Responses server exited early")
+                raise RuntimeError("Qwen chat server exited early")
             time.sleep(2)
-    raise RuntimeError("Qwen Responses server did not become ready")
+    raise RuntimeError("Qwen chat server did not become ready")
 
 
 async def handle_job(ws, job_id: str, task: str, workspace_files: list) -> None:
     async def emit(ev: dict):
         await ws.send(json.dumps({"type": "event", "job_id": job_id, "event": ev}))
 
-    await emit({"type": "agent.started", "message": "Codex agent starting"})
-    await emit({"type": "thinking", "message": "Codex agent started"})
+    await emit({"type": "agent.started", "message": "Qwen Code agent starting"})
+    await emit({"type": "thinking", "message": "Qwen Code agent started"})
 
     ws_obj = Workspace(workspace_files)
-    codex_home = Path(ws_obj.root) / ".blippy-codex-home"
-    write_codex_home(codex_home, qwen_base=f"http://127.0.0.1:{QWEN_PORT}/v1")
-    codex_bin = ensure_codex_binary()
+    qwen_home = Path(ws_obj.root) / ".blippy-qwen-home"
+    write_qwen_home(qwen_home, qwen_base=f"http://127.0.0.1:{QWEN_CHAT_PORT}/v1")
+    qwen_bin = ensure_qwen_binary()
 
     loop = asyncio.get_event_loop()
     log_buf: list[str] = []
 
     def on_line(line: str):
         log_buf.append(line)
+        low = line.lower()
+        if any(k in low for k in ("write_file", "edit", "apply", "creating", "writing")):
+            asyncio.run_coroutine_threadsafe(
+                emit({"type": "thinking", "message": line[:300]}), loop)
+        elif any(k in low for k in ("exec", "shell", "running", "bash")):
+            asyncio.run_coroutine_threadsafe(
+                emit({"type": "command_started", "command": line[:300]}), loop)
 
-    def on_event(ev: dict):
-        asyncio.run_coroutine_threadsafe(emit(ev), loop)
-
-    await emit({"type": "model.started", "message": "Qwen generating via Codex provider"})
+    await emit({"type": "model.started", "message": "Qwen generating via Qwen Code provider"})
     result = await loop.run_in_executor(
         None,
-        lambda: run_codex_exec(
-            Path(ws_obj.root),
-            task,
-            codex_bin=codex_bin,
-            codex_home=codex_home,
+        lambda: run_qwen_exec(
+            Path(ws_obj.root), task, qwen_bin=qwen_bin, qwen_home=qwen_home,
             on_line=on_line,
-            on_event=on_event,
         ),
     )
     changes = ws_obj.diff_changes()
     ws_obj.cleanup()
 
     if result.get("ok") or changes:
-        await emit({"type": "agent.completed", "message": "Codex agent completed"})
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "job_result",
-                    "job_id": job_id,
-                    "status": "completed",
-                    "result": {
-                        "summary": "codex exec finished",
-                        "changes": changes,
-                        "codex_ok": result.get("ok"),
-                        "log_tail": (result.get("log") or "")[-2000:],
-                    },
-                    "error": None if (result.get("ok") or changes) else result.get("error"),
-                }
-            )
-        )
+        await emit({"type": "agent.completed", "message": "Qwen Code agent completed"})
+        await ws.send(json.dumps({
+            "type": "job_result", "job_id": job_id, "status": "completed",
+            "result": {"summary": "qwen exec finished", "changes": changes,
+                       "qwen_ok": result.get("ok"),
+                       "log_tail": (result.get("log") or "")[-2000:]},
+            "error": None if (result.get("ok") or changes) else result.get("error"),
+        }))
     else:
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "job_result",
-                    "job_id": job_id,
-                    "status": "failed",
-                    "result": {"changes": changes, "log_tail": (result.get("log") or "")[-2000:]},
-                    "error": result.get("error") or f"codex exit {result.get('exit_code')}",
-                }
-            )
-        )
+        await ws.send(json.dumps({
+            "type": "job_result", "job_id": job_id, "status": "failed",
+            "result": {"changes": changes, "log_tail": (result.get("log") or "")[-2000:]},
+            "error": result.get("error") or f"qwen exit {result.get('exit_code')}",
+        }))
 
 
 async def run_worker() -> None:
     import websockets
 
     print(f"[blippy] worker {WORKER_ID}", flush=True)
-    print("[blippy] ensuring Codex CLI binary (upstream harness)...", flush=True)
-    ensure_codex_binary()
-    print("[blippy] starting Qwen Responses adapter (model boundary only)...", flush=True)
-    qwen_proc = start_qwen_responses_server()
+    print("[blippy] ensuring Qwen Code CLI binary (upstream harness)...", flush=True)
+    ensure_qwen_binary()
+    print("[blippy] starting Qwen chat adapter (model boundary only)...", flush=True)
+    qwen_proc = start_qwen_chat_server()
 
     uri = f"{WS_URL}?token={TOKEN}&worker_id={WORKER_ID}"
     backoff = 2
@@ -173,17 +164,9 @@ async def run_worker() -> None:
                         try:
                             await handle_job(ws, job_id, task, workspace.get("files") or [])
                         except Exception as e:
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "job_result",
-                                        "job_id": job_id,
-                                        "status": "failed",
-                                        "result": None,
-                                        "error": str(e),
-                                    }
-                                )
-                            )
+                            await ws.send(json.dumps({
+                                "type": "job_result", "job_id": job_id,
+                                "status": "failed", "result": None, "error": str(e)}))
                         await ws.send(json.dumps({"type": "idle"}))
             except Exception as e:
                 print(f"[blippy] ws error: {e}; retry {backoff}s", flush=True)

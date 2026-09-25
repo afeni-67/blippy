@@ -1,4 +1,4 @@
-"""Isolated temp workspace + final diff. Mutations are done by Codex tools, not Blippy."""
+"""Isolated temp workspace + final diff. Mutations are done by Qwen Code tools, not Blippy."""
 from __future__ import annotations
 
 import shutil
