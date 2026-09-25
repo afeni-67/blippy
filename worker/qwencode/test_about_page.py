@@ -77,6 +77,13 @@ def main() -> int:
                                          "n_changes": len(changes)}), flush=True)
     print("ABOUT_HTML_HEAD " + html[:600].replace("\n", "\\n"), flush=True)
     print("QWEN_LOG_TAIL " + (res.get("log") or "")[-2500:].replace("\n", "\\n"), flush=True)
+    try:
+        out_dir = Path(os.environ.get("GITHUB_WORKSPACE", "."))
+        if html:
+            (out_dir / "about.html").write_text(html, encoding="utf-8")
+            print(f"saved about.html ({len(html)} chars) for artifact", flush=True)
+    except Exception as e:
+        print(f"artifact save failed: {e}", flush=True)
     ws.cleanup()
     print("ABOUT " + ("PASS" if ok else "FAIL"), flush=True)
     return 0 if ok else 1

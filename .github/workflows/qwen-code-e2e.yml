@@ -69,6 +69,8 @@ jobs:
       - name: Dump evidence
         if: always()
         run: |
+          echo "===== about.html (full) ====="
+          cat about.html 2>/dev/null || echo "(no about.html)"
           echo "===== chat requests seen by adapter ====="
           cat blippy-chat-requests.jsonl 2>/dev/null || echo "(no request log)"
           echo "===== qwen raw outputs ====="
@@ -81,6 +83,7 @@ jobs:
         with:
           name: qwen-code-e2e-evidence
           path: |
+            about.html
             blippy-chat-requests.jsonl
             blippy-qwen-chat.txt
             qwen-chat.log
